@@ -1,0 +1,96 @@
+name: Build metavision_viewer (Windows)
+
+on:
+  workflow_dispatch:
+
+env:
+  VCPKG_TAG: "2024.11.16"
+
+jobs:
+  build:
+    name: Windows x64 Release
+    runs-on: windows-2022
+    timeout-minutes: 180
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Long paths
+        shell: bash
+        run: git config --system core.longpaths true
+
+      - name: Fetch vcpkg
+        shell: bash
+        run: |
+          curl -L -o vcpkg.zip "https://github.com/microsoft/vcpkg/archive/refs/tags/${VCPKG_TAG}.zip"
+          unzip -q vcpkg.zip -d "$RUNNER_TEMP"
+          mv "$RUNNER_TEMP/vcpkg-${VCPKG_TAG}" "$RUNNER_TEMP/vcpkg"
+          cp utils/windows/11/vcpkg-openeb.json "$RUNNER_TEMP/vcpkg/vcpkg.json"
+
+      - name: Restore vcpkg binary cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/vcpkg-cache
+          key: vcpkg-bincache-${{ env.VCPKG_TAG }}-${{ hashFiles('utils/windows/11/vcpkg-openeb.json') }}
+
+      - name: Install dependencies with vcpkg
+        shell: cmd
+        env:
+          VCPKG_DEFAULT_BINARY_CACHE: ${{ runner.temp }}\vcpkg-cache
+        run: |
+          if not exist "%VCPKG_DEFAULT_BINARY_CACHE%" mkdir "%VCPKG_DEFAULT_BINARY_CACHE%"
+          cd /d "%RUNNER_TEMP%\vcpkg"
+          call bootstrap-vcpkg.bat -disableMetrics
+          vcpkg.exe install --triplet x64-windows --x-install-root installed
+
+      - name: Configure
+        shell: bash
+        run: |
+          VCPKG_DIR="$(cygpath -m "$RUNNER_TEMP/vcpkg")"
+          cmake -S . -B build -A x64 \
+            -DCMAKE_TOOLCHAIN_FILE="cmake/toolchains/vcpkg.cmake" \
+            -DVCPKG_DIRECTORY="$VCPKG_DIR" \
+            -DBUILD_TESTING=OFF \
+            -DCOMPILE_PYTHON3_BINDINGS=OFF
+
+      - name: Build
+        shell: bash
+        run: cmake --build build --config Release --parallel 4
+
+      - name: Install and bundle
+        shell: bash
+        run: |
+          cmake --install build --config Release --prefix dist
+          # runtime DLLs from vcpkg (OpenCV, Boost, GLEW, GLFW, HDF5, protobuf, libusb, ...)
+          cp "$RUNNER_TEMP"/vcpkg/installed/x64-windows/bin/*.dll dist/bin/ || true
+          # launcher that points the HAL to the bundled plugins
+          cat > dist/metavision_viewer.bat <<'EOF'
+          @echo off
+          set "ROOT=%~dp0"
+          set "PATH=%ROOT%bin;%PATH%"
+          set "MV_HAL_PLUGIN_PATH=%ROOT%lib\metavision\hal\plugins"
+          "%ROOT%bin\metavision_viewer.exe" %*
+          EOF
+          sed -i 's/^          //' dist/metavision_viewer.bat
+          echo "---- dist tree ----"
+          find dist -maxdepth 4 -not -path "*/include/*" | sort | head -150
+
+      - name: Smoke test
+        shell: cmd
+        run: |
+          dist\bin\metavision_viewer.exe --help
+          if not exist dist\lib\metavision\hal\plugins echo WARNING: plugin folder not found at expected path
+
+      - name: Package
+        shell: bash
+        run: |
+          rm -rf dist/include dist/share/cmake
+          7z a -tzip metavision_viewer_win64.zip ./dist/*
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: metavision_viewer_win64
+          path: metavision_viewer_win64.zip
