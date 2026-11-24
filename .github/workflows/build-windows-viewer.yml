@@ -30,6 +30,8 @@ jobs:
         with:
           path: C:\vcache
           key: vcpkg-bincache-${{ hashFiles('utils/windows/11/vcpkg-openeb.json') }}
+          restore-keys: |
+            vcpkg-bincache-
 
       - name: Install dependencies with vcpkg
         shell: cmd
@@ -79,20 +81,44 @@ jobs:
           echo "---- dist tree ----"
           find dist -maxdepth 4 -not -path "*/include/*" | sort | head -150
 
-      - name: Smoke test
-        shell: cmd
+      - name: Build player library (mv_player.dll) and selftest
+        shell: bash
         run: |
-          dist\bin\metavision_viewer.exe --help
-          if not exist dist\lib\metavision\hal\plugins echo WARNING: plugin folder not found at expected path
+          ROOT="$(pwd -W)"
+          cmake -S utils/mv_raw_player/native -B build_player -A x64 \
+            -DCMAKE_TOOLCHAIN_FILE="$ROOT/cmake/toolchains/vcpkg.cmake" \
+            -DVCPKG_DIRECTORY="C:/v" \
+            -DCMAKE_PREFIX_PATH="$ROOT/dist"
+          cmake --build build_player --config Release
+          cp build_player/Release/mv_player.dll dist/bin/
+          cp build_player/Release/mvp_selftest.exe dist/bin/
+
+      - name: Selftest (generate a RAW file and play it headless)
+        shell: bash
+        run: |
+          python utils/mv_raw_player/tools/gen_raw.py test.raw 6
+          PLUG="$(find dist -iname '*hal_plugin*.dll' | head -1)"
+          echo "plugin dll: $PLUG"
+          test -n "$PLUG"
+          export MV_HAL_PLUGIN_PATH="$(cd "$(dirname "$PLUG")" && pwd -W)"
+          export PATH="$(pwd):$(pwd)/dist/bin:$PATH"
+          ./dist/bin/mvp_selftest.exe test.raw
+
+      - name: Build WinForms app (MvRawPlayer.exe)
+        shell: bash
+        run: |
+          dotnet build utils/mv_raw_player/app/MvRawPlayer.csproj -c Release -o dist/bin
+          printf '@echo off\r\nstart "" "%%~dp0bin\\MvRawPlayer.exe" %%*\r\n' > dist/MvRawPlayer.bat
+          cat dist/MvRawPlayer.bat
 
       - name: Package
         shell: bash
         run: |
           rm -rf dist/include dist/share/cmake
-          7z a -tzip metavision_viewer_win64.zip ./dist/*
+          7z a -tzip mv_raw_player_win64.zip ./dist/*
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: metavision_viewer_win64
-          path: metavision_viewer_win64.zip
+          name: mv_raw_player_win64
+          path: mv_raw_player_win64.zip
