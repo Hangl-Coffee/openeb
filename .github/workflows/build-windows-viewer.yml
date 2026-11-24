@@ -3,9 +3,6 @@ name: Build metavision_viewer (Windows)
 on:
   workflow_dispatch:
 
-env:
-  VCPKG_EXPORT_URL: "https://prophesee-bamboo.s3.eu-west-1.amazonaws.com/build-env/vcpkg-export-win11-20260112-MV_V5.2.0.zip"
-
 jobs:
   build:
     name: Windows x64 Release
@@ -21,23 +18,40 @@ jobs:
         shell: bash
         run: git config --system core.longpaths true
 
-      - name: Fetch prebuilt vcpkg dependencies (published by Prophesee)
+      - name: Get vcpkg (current tool, dependency versions pinned by OpenEB manifest)
         shell: bash
         run: |
-          curl -fL --retry 3 -o vcpkg-export.zip "$VCPKG_EXPORT_URL"
-          mkdir -p "$RUNNER_TEMP/export"
-          7z x -y -o"$RUNNER_TEMP/export" vcpkg-export.zip > /dev/null
-          TC="$(find "$RUNNER_TEMP/export" -path '*scripts/buildsystems/vcpkg.cmake' | head -1)"
-          test -n "$TC" || { echo "vcpkg toolchain not found in export"; find "$RUNNER_TEMP/export" -maxdepth 2; exit 1; }
-          VCPKG_ROOT_DIR="$(dirname "$(dirname "$(dirname "$TC")")")"
-          echo "VCPKG_ROOT_DIR=$VCPKG_ROOT_DIR" >> "$GITHUB_ENV"
-          echo "vcpkg root: $VCPKG_ROOT_DIR"
-          ls "$VCPKG_ROOT_DIR/installed"
+          git clone --depth 1 https://github.com/microsoft/vcpkg.git /c/v
+          cp utils/windows/11/vcpkg-openeb.json /c/v/vcpkg.json
+          echo "VCPKG_ROOT_DIR=C:/v" >> "$GITHUB_ENV"
+
+      - name: Restore vcpkg binary cache
+        uses: actions/cache/restore@v4
+        with:
+          path: C:\vcache
+          key: vcpkg-bincache-${{ hashFiles('utils/windows/11/vcpkg-openeb.json') }}
+
+      - name: Install dependencies with vcpkg
+        shell: cmd
+        env:
+          VCPKG_DEFAULT_BINARY_CACHE: C:\vcache
+        run: |
+          if not exist C:\vcache mkdir C:\vcache
+          cd /d C:\v
+          call bootstrap-vcpkg.bat -disableMetrics
+          vcpkg.exe install --triplet x64-windows --x-install-root installed
+
+      - name: Save vcpkg binary cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: C:\vcache
+          key: vcpkg-bincache-${{ hashFiles('utils/windows/11/vcpkg-openeb.json') }}-${{ github.run_id }}
 
       - name: Configure
         shell: bash
         run: |
-          VCPKG_DIR="$(cygpath -m "$VCPKG_ROOT_DIR")"
+          VCPKG_DIR="C:/v"
           cmake -S . -B build -A x64 \
             -DCMAKE_TOOLCHAIN_FILE="cmake/toolchains/vcpkg.cmake" \
             -DVCPKG_DIRECTORY="$VCPKG_DIR" \
@@ -53,7 +67,7 @@ jobs:
         run: |
           cmake --install build --config Release --prefix dist
           # runtime DLLs from vcpkg (OpenCV, Boost, GLEW, GLFW, HDF5, protobuf, libusb, ...)
-          cp "$VCPKG_ROOT_DIR"/installed/x64-windows/bin/*.dll dist/bin/ || true
+          cp "/c/v/installed"/x64-windows/bin/*.dll dist/bin/ || true
           # launcher that points the HAL to the bundled plugins
           cat > dist/metavision_viewer.bat <<'EOF'
           @echo off
