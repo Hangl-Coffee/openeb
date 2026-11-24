@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
 
 env:
-  VCPKG_TAG: "2024.11.16"
+  VCPKG_EXPORT_URL: "https://prophesee-bamboo.s3.eu-west-1.amazonaws.com/build-env/vcpkg-export-win11-20260112-MV_V5.2.0.zip"
 
 jobs:
   build:
@@ -21,34 +21,23 @@ jobs:
         shell: bash
         run: git config --system core.longpaths true
 
-      - name: Fetch vcpkg
+      - name: Fetch prebuilt vcpkg dependencies (published by Prophesee)
         shell: bash
         run: |
-          curl -L -o vcpkg.zip "https://github.com/microsoft/vcpkg/archive/refs/tags/${VCPKG_TAG}.zip"
-          unzip -q vcpkg.zip -d "$RUNNER_TEMP"
-          mv "$RUNNER_TEMP/vcpkg-${VCPKG_TAG}" "$RUNNER_TEMP/vcpkg"
-          cp utils/windows/11/vcpkg-openeb.json "$RUNNER_TEMP/vcpkg/vcpkg.json"
-
-      - name: Restore vcpkg binary cache
-        uses: actions/cache@v4
-        with:
-          path: ${{ runner.temp }}/vcpkg-cache
-          key: vcpkg-bincache-${{ env.VCPKG_TAG }}-${{ hashFiles('utils/windows/11/vcpkg-openeb.json') }}
-
-      - name: Install dependencies with vcpkg
-        shell: cmd
-        env:
-          VCPKG_DEFAULT_BINARY_CACHE: ${{ runner.temp }}\vcpkg-cache
-        run: |
-          if not exist "%VCPKG_DEFAULT_BINARY_CACHE%" mkdir "%VCPKG_DEFAULT_BINARY_CACHE%"
-          cd /d "%RUNNER_TEMP%\vcpkg"
-          call bootstrap-vcpkg.bat -disableMetrics
-          vcpkg.exe install --triplet x64-windows --x-install-root installed
+          curl -fL --retry 3 -o vcpkg-export.zip "$VCPKG_EXPORT_URL"
+          mkdir -p "$RUNNER_TEMP/export"
+          7z x -y -o"$RUNNER_TEMP/export" vcpkg-export.zip > /dev/null
+          TC="$(find "$RUNNER_TEMP/export" -path '*scripts/buildsystems/vcpkg.cmake' | head -1)"
+          test -n "$TC" || { echo "vcpkg toolchain not found in export"; find "$RUNNER_TEMP/export" -maxdepth 2; exit 1; }
+          VCPKG_ROOT_DIR="$(dirname "$(dirname "$(dirname "$TC")")")"
+          echo "VCPKG_ROOT_DIR=$VCPKG_ROOT_DIR" >> "$GITHUB_ENV"
+          echo "vcpkg root: $VCPKG_ROOT_DIR"
+          ls "$VCPKG_ROOT_DIR/installed"
 
       - name: Configure
         shell: bash
         run: |
-          VCPKG_DIR="$(cygpath -m "$RUNNER_TEMP/vcpkg")"
+          VCPKG_DIR="$(cygpath -m "$VCPKG_ROOT_DIR")"
           cmake -S . -B build -A x64 \
             -DCMAKE_TOOLCHAIN_FILE="cmake/toolchains/vcpkg.cmake" \
             -DVCPKG_DIRECTORY="$VCPKG_DIR" \
@@ -64,7 +53,7 @@ jobs:
         run: |
           cmake --install build --config Release --prefix dist
           # runtime DLLs from vcpkg (OpenCV, Boost, GLEW, GLFW, HDF5, protobuf, libusb, ...)
-          cp "$RUNNER_TEMP"/vcpkg/installed/x64-windows/bin/*.dll dist/bin/ || true
+          cp "$VCPKG_ROOT_DIR"/installed/x64-windows/bin/*.dll dist/bin/ || true
           # launcher that points the HAL to the bundled plugins
           cat > dist/metavision_viewer.bat <<'EOF'
           @echo off
@@ -73,7 +62,6 @@ jobs:
           set "MV_HAL_PLUGIN_PATH=%ROOT%lib\metavision\hal\plugins"
           "%ROOT%bin\metavision_viewer.exe" %*
           EOF
-          sed -i 's/^          //' dist/metavision_viewer.bat
           echo "---- dist tree ----"
           find dist -maxdepth 4 -not -path "*/include/*" | sort | head -150
 
