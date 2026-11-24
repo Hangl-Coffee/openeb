@@ -1,5 +1,6 @@
 using System;
 using System.Drawing;
+using System.Drawing.Drawing2D;
 using System.Drawing.Imaging;
 using System.IO;
 using System.Runtime.InteropServices;
@@ -115,11 +116,170 @@ namespace MvRawPlayer
         public static extern void mvp_render_bgra(IntPtr h, IntPtr dst, int stride);
     }
 
-    /// <summary>Event-camera RAW player: file open / drag&amp;drop, play / pause, loop, speed, wheel speed control,
+    /// <summary>Video surface with mouse-wheel zoom (around the cursor), drag panning and double-click reset.</summary>
+    internal sealed class VideoView : Control
+    {
+        private const double MinZoom = 0.25;
+        private const double MaxZoom = 64.0;
+
+        private Image _image;
+        private double _zoom = 1.0;          // 1.0 = fit to window
+        private double _panX, _panY;         // offset of the image centre from the view centre (pixels)
+        private bool _panning;
+        private Point _panStart;
+        private double _panStartX, _panStartY;
+
+        public VideoView()
+        {
+            SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint |
+                     ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
+        }
+
+        public Image Image
+        {
+            get { return _image; }
+            set
+            {
+                bool first = _image == null || value == null;
+                _image = value;
+                if (first)
+                    ResetView();
+                Invalidate();
+            }
+        }
+
+        public double Zoom { get { return _zoom; } }
+
+        /// <summary>Raised for a mouse wheel notch over the view (used when the form-level filter does not see it).</summary>
+        public event Action<int, Point> WheelMoved;
+
+        protected override void OnMouseWheel(MouseEventArgs e)
+        {
+            base.OnMouseWheel(e);
+            Action<int, Point> h = WheelMoved;
+            if (h != null)
+                h(e.Delta, e.Location);
+        }
+
+        public void ResetView()
+        {
+            _zoom = 1.0;
+            _panX = _panY = 0.0;
+            Invalidate();
+        }
+
+        private double FitScale()
+        {
+            if (_image == null || ClientSize.Width <= 0 || ClientSize.Height <= 0)
+                return 1.0;
+            return Math.Min(ClientSize.Width / (double)_image.Width, ClientSize.Height / (double)_image.Height);
+        }
+
+        /// <summary>Zooms by <paramref name="factor"/> keeping the image point under <paramref name="pt"/> fixed.</summary>
+        public void ZoomAt(Point pt, double factor)
+        {
+            if (_image == null)
+                return;
+            double oldScale = FitScale() * _zoom;
+            double newZoom = Math.Max(MinZoom, Math.Min(MaxZoom, _zoom * factor));
+            double newScale = FitScale() * newZoom;
+            double cx = ClientSize.Width / 2.0, cy = ClientSize.Height / 2.0;
+            // image coordinate under the cursor, relative to the image centre
+            double ix = (pt.X - cx - _panX) / oldScale;
+            double iy = (pt.Y - cy - _panY) / oldScale;
+            _zoom = newZoom;
+            _panX = pt.X - cx - ix * newScale;
+            _panY = pt.Y - cy - iy * newScale;
+            ClampPan();
+            Invalidate();
+        }
+
+        private void ClampPan()
+        {
+            if (_image == null)
+                return;
+            double scale = FitScale() * _zoom;
+            double hw = _image.Width * scale / 2.0, hh = _image.Height * scale / 2.0;
+            double lx = ClientSize.Width / 2.0 + hw - 40, ly = ClientSize.Height / 2.0 + hh - 40;
+            _panX = Math.Max(-lx, Math.Min(lx, _panX));
+            _panY = Math.Max(-ly, Math.Min(ly, _panY));
+        }
+
+        protected override void OnMouseDown(MouseEventArgs e)
+        {
+            base.OnMouseDown(e);
+            if (e.Button == MouseButtons.Left && _image != null)
+            {
+                _panning = true;
+                _panStart = e.Location;
+                _panStartX = _panX;
+                _panStartY = _panY;
+                Cursor = Cursors.SizeAll;
+            }
+        }
+
+        protected override void OnMouseMove(MouseEventArgs e)
+        {
+            base.OnMouseMove(e);
+            if (_panning)
+            {
+                _panX = _panStartX + (e.X - _panStart.X);
+                _panY = _panStartY + (e.Y - _panStart.Y);
+                ClampPan();
+                Invalidate();
+            }
+        }
+
+        protected override void OnMouseUp(MouseEventArgs e)
+        {
+            base.OnMouseUp(e);
+            _panning = false;
+            Cursor = Cursors.Default;
+        }
+
+        protected override void OnDoubleClick(EventArgs e)
+        {
+            base.OnDoubleClick(e);
+            ResetView();
+        }
+
+        protected override void OnResize(EventArgs e)
+        {
+            base.OnResize(e);
+            ClampPan();
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            Graphics g = e.Graphics;
+            g.Clear(BackColor);
+            if (_image == null)
+                return;
+            double scale = FitScale() * _zoom;
+            double w = _image.Width * scale, h = _image.Height * scale;
+            double x = ClientSize.Width / 2.0 + _panX - w / 2.0;
+            double y = ClientSize.Height / 2.0 + _panY - h / 2.0;
+            g.InterpolationMode = scale >= 1.0 ? InterpolationMode.NearestNeighbor : InterpolationMode.HighQualityBilinear;
+            g.PixelOffsetMode = PixelOffsetMode.Half;
+            g.DrawImage(_image, new RectangleF((float)x, (float)y, (float)w, (float)h));
+
+            string label = string.Format("{0:0.##}x  ({1}%)", _zoom, (int)Math.Round(scale * 100.0));
+            using (var f = new Font("Segoe UI", 9f))
+            {
+                SizeF sz = g.MeasureString(label, f);
+                using (var b = new SolidBrush(Color.FromArgb(150, 0, 0, 0)))
+                    g.FillRectangle(b, 6, 6, sz.Width + 8, sz.Height + 2);
+                g.DrawString(label, f, Brushes.Gainsboro, 10, 7);
+            }
+        }
+    }
+
+    /// <summary>Event-camera RAW player: file open / drag&amp;drop, play / pause, loop, speed, wheel zoom / pan,
     /// position slider and accumulation-time slider.</summary>
     public sealed class MainForm : Form, IMessageFilter
     {
         private const int WM_MOUSEWHEEL = 0x020A;
+        private const int MK_SHIFT = 0x0004;
         private const int MK_CONTROL = 0x0008;
 
         // speed slider: value 0..200  ->  speed = 10^((value-100)/50)  (0.01x .. 100x, 1x at 100)
@@ -132,7 +292,7 @@ namespace MvRawPlayer
         private long _startUs, _endUs;
         private Bitmap _bmp;
 
-        private readonly PictureBox _pic = new PictureBox();
+        private readonly VideoView _pic = new VideoView();
         private readonly Label _hint = new Label();
         private readonly Button _btnOpen = new Button();
         private readonly Button _btnPlay = new Button();
@@ -203,11 +363,10 @@ namespace MvRawPlayer
             // video area
             _pic.Dock = DockStyle.Fill;
             _pic.BackColor = Color.FromArgb(24, 26, 30);
-            _pic.SizeMode = PictureBoxSizeMode.Zoom;
             _pic.AllowDrop = true;
+            _pic.WheelMoved += (d, pt) => HandleWheel(d, pt, (ModifierKeys & Keys.Control) != 0, (ModifierKeys & Keys.Shift) != 0);
             _pic.DragEnter += OnDragEnter;
             _pic.DragDrop += OnDragDrop;
-            _pic.DoubleClick += (s, e) => TogglePlay();
             _hint.Dock = DockStyle.Fill;
             _hint.TextAlign = ContentAlignment.MiddleCenter;
             _hint.ForeColor = Color.Gainsboro;
@@ -342,7 +501,7 @@ namespace MvRawPlayer
                 ForeColor = Color.DimGray,
                 TextAlign = ContentAlignment.MiddleLeft,
                 Padding = new Padding(10, 0, 0, 0),
-                Text = "마우스 휠: 재생 속도  |  Ctrl+휠: 누적 시간  |  Space: 재생/일시정지  |  ←/→: ±1초  |  영상 더블클릭: 재생/일시정지",
+                Text = "마우스 휠: 확대/축소  |  드래그: 이동  |  더블클릭 또는 0: 화면 맞춤  |  Ctrl+휠: 재생 속도  |  Shift+휠: 누적 시간  |  Space: 재생/일시정지  |  ←/→: ±1초",
             };
 
             Controls.Add(_pic);
@@ -582,6 +741,11 @@ namespace MvRawPlayer
                 TogglePlay();
                 return true;
             }
+            if ((keyData == Keys.D0 || keyData == Keys.NumPad0) && !(ActiveControl is TextBoxBase))
+            {
+                _pic.ResetView();
+                return true;
+            }
             if ((keyData == Keys.Left || keyData == Keys.Right) && !(ActiveControl is TrackBar))
             {
                 StepSeconds(keyData == Keys.Left ? -1.0 : 1.0);
@@ -590,7 +754,20 @@ namespace MvRawPlayer
             return base.ProcessCmdKey(ref msg, keyData);
         }
 
-        /// <summary>Mouse wheel over the video: changes the playback speed (Ctrl: accumulation time).</summary>
+        private void HandleWheel(int delta, Point pt, bool ctrl, bool shift)
+        {
+            int steps = Math.Max(1, Math.Abs(delta) / 120);
+            int dir = delta > 0 ? 1 : -1;
+            if (ctrl)
+                _tbSpeed.Value = Math.Max(_tbSpeed.Minimum, Math.Min(_tbSpeed.Maximum, _tbSpeed.Value + dir * 4 * steps));
+            else if (shift)
+                _tbAcc.Value = Math.Max(_tbAcc.Minimum, Math.Min(_tbAcc.Maximum, _tbAcc.Value + dir * 5 * steps));
+            else
+                _pic.ZoomAt(pt, Math.Pow(1.2, delta / 120.0));
+        }
+
+        /// <summary>Mouse wheel over the video: zoom in/out around the cursor
+        /// (Ctrl: playback speed, Shift: accumulation time).</summary>
         public bool PreFilterMessage(ref Message m)
         {
             if (m.Msg != WM_MOUSEWHEEL || Form.ActiveForm != this)
@@ -601,13 +778,7 @@ namespace MvRawPlayer
 
             long wp = m.WParam.ToInt64();
             int delta = (short)((wp >> 16) & 0xFFFF);
-            bool ctrl = (wp & MK_CONTROL) != 0;
-            int steps = Math.Max(1, Math.Abs(delta) / 120);
-            int dir = delta > 0 ? 1 : -1;
-            if (ctrl)
-                _tbAcc.Value = Math.Max(_tbAcc.Minimum, Math.Min(_tbAcc.Maximum, _tbAcc.Value + dir * 5 * steps));
-            else
-                _tbSpeed.Value = Math.Max(_tbSpeed.Minimum, Math.Min(_tbSpeed.Maximum, _tbSpeed.Value + dir * 4 * steps));
+            HandleWheel(delta, _pic.PointToClient(Cursor.Position), (wp & MK_CONTROL) != 0, (wp & MK_SHIFT) != 0);
             return true;
         }
     }
