@@ -131,6 +131,13 @@ namespace MvRawPlayer
         [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
         public static extern int mvp_roi_peaks(IntPtr h, int idx, [In, Out] double[] hz, [In, Out] double[] strength,
             int maxN, out double total);
+
+        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+        public static extern int mvp_roi_amp(IntPtr h, int idx, double f0, [In, Out] double[] outv);
+
+        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+        public static extern int mvp_roi_series(IntPtr h, int idx, int axis, int maxN, [In, Out] float[] tMs,
+            [In, Out] float[] val, out double windowMs);
     }
 
     /// <summary>Video surface with mouse-wheel zoom (around the cursor), drag panning and double-click reset.</summary>
@@ -405,6 +412,90 @@ namespace MvRawPlayer
         }
     }
 
+    /// <summary>Displacement waveform (X / Y position of the vibrating object, mean removed).</summary>
+    internal sealed class WaveView : Control
+    {
+        private float[] _tx = new float[0], _vx = new float[0], _ty = new float[0], _vy = new float[0];
+        private double _winMs = 1000;
+        private double _mmPerPx;
+
+        public WaveView()
+        {
+            SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint |
+                     ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
+            BackColor = Color.FromArgb(24, 26, 30);
+        }
+
+        public void SetData(float[] tx, float[] vx, int nx, float[] ty, float[] vy, int ny, double winMs, double mmPerPx)
+        {
+            _tx = new float[Math.Max(0, nx)]; _vx = new float[_tx.Length];
+            Array.Copy(tx, _tx, _tx.Length); Array.Copy(vx, _vx, _vx.Length);
+            _ty = new float[Math.Max(0, ny)]; _vy = new float[_ty.Length];
+            Array.Copy(ty, _ty, _ty.Length); Array.Copy(vy, _vy, _vy.Length);
+            _winMs = Math.Max(1.0, winMs);
+            _mmPerPx = mmPerPx;
+            Invalidate();
+        }
+
+        public void Clear()
+        {
+            _tx = new float[0]; _vx = new float[0]; _ty = new float[0]; _vy = new float[0];
+            Invalidate();
+        }
+
+        private void DrawTrace(Graphics g, Rectangle plot, float[] t, float[] v, double range, Color col)
+        {
+            if (t.Length < 2)
+                return;
+            var pts = new PointF[t.Length];
+            for (int i = 0; i < t.Length; ++i)
+            {
+                float x = plot.Left + (float)(t[i] / _winMs * plot.Width);
+                float y = plot.Top + plot.Height / 2f - (float)(v[i] / range * (plot.Height / 2.0 - 2));
+                pts[i] = new PointF(x, y);
+            }
+            using (var pen = new Pen(col, 1.5f))
+                g.DrawLines(pen, pts);
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            Graphics g = e.Graphics;
+            g.Clear(BackColor);
+            var plot = new Rectangle(46, 22, Math.Max(10, Width - 56), Math.Max(10, Height - 22 - 20));
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            using (var f = new Font("Segoe UI", 8.5f))
+            using (var fb = new Font("Segoe UI", 9f, FontStyle.Bold))
+            {
+                g.DrawString("변위 파형 (평균 제거)", fb, Brushes.Gainsboro, 4, 2);
+                using (var axis = new Pen(Color.FromArgb(90, 95, 105)))
+                    g.DrawRectangle(axis, plot);
+                double max = 1.0;
+                foreach (float v in _vx) max = Math.Max(max, Math.Abs(v));
+                foreach (float v in _vy) max = Math.Max(max, Math.Abs(v));
+                double range = 1;
+                double[] nice = { 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000 };
+                foreach (double nv in nice) { range = nv; if (nv >= max * 1.1) break; }
+                using (var zp = new Pen(Color.FromArgb(60, 65, 75)))
+                    g.DrawLine(zp, plot.Left, plot.Top + plot.Height / 2, plot.Right, plot.Top + plot.Height / 2);
+                string top = "+" + range.ToString("0") + " px";
+                string bot = "-" + range.ToString("0") + " px";
+                g.DrawString(top, f, Brushes.Silver, 2, plot.Top - 2);
+                g.DrawString(bot, f, Brushes.Silver, 2, plot.Bottom - 14);
+                if (_mmPerPx > 0)
+                    g.DrawString("(" + (range * _mmPerPx).ToString("0.###") + " mm)", f, Brushes.DimGray, 2, plot.Top + 10);
+                DrawTrace(g, plot, _tx, _vx, range, Color.Cyan);
+                DrawTrace(g, plot, _ty, _vy, range, Color.Orange);
+                g.DrawString("0", f, Brushes.Silver, plot.Left - 4, plot.Bottom + 2);
+                string te = _winMs.ToString("0") + " ms";
+                SizeF ts = g.MeasureString(te, f);
+                g.DrawString(te, f, Brushes.Silver, plot.Right - ts.Width, plot.Bottom + 2);
+                g.DrawString("X", fb, Brushes.Cyan, plot.Right - 34, 2);
+                g.DrawString("Y", fb, Brushes.Orange, plot.Right - 16, 2);
+            }
+        }
+    }
+
     /// <summary>Frequency histogram of one ROI with peak markers.</summary>
     internal sealed class SpectrumView : Control
     {
@@ -552,6 +643,8 @@ namespace MvRawPlayer
         private readonly bool[] _roiUsed = new bool[MaxRoi];
         private readonly ListBox _lstRoi = new ListBox();
         private readonly SpectrumView _spec = new SpectrumView();
+        private readonly WaveView _wave = new WaveView();
+        private readonly NumericUpDown _numScale = new NumericUpDown();
         private readonly CheckBox _chkRoiMode = new CheckBox();
         private readonly Button _btnRoiClear = new Button();
         private readonly NumericUpDown _numWindow = new NumericUpDown();
@@ -567,8 +660,8 @@ namespace MvRawPlayer
             AutoScaleDimensions = new SizeF(96F, 96F);
             AutoScaleMode = AutoScaleMode.Dpi;
             Text = "MV RAW Player";
-            ClientSize = new Size(1380, 780);
-            MinimumSize = new Size(980, 560);
+            ClientSize = new Size(1380, 860);
+            MinimumSize = new Size(980, 640);
             StartPosition = FormStartPosition.CenterScreen;
             Font = new Font("Segoe UI", 9f);
             AllowDrop = true;
@@ -603,9 +696,10 @@ namespace MvRawPlayer
 
             _spec.Dock = DockStyle.Fill;
 
-            var settings = new TableLayoutPanel { Dock = DockStyle.Bottom, Height = 62, ColumnCount = 2, RowCount = 2 };
+            var settings = new TableLayoutPanel { Dock = DockStyle.Bottom, Height = 92, ColumnCount = 2, RowCount = 3 };
             settings.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
             settings.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 90));
+            settings.RowStyles.Add(new RowStyle(SizeType.Absolute, 30));
             settings.RowStyles.Add(new RowStyle(SizeType.Absolute, 30));
             settings.RowStyles.Add(new RowStyle(SizeType.Absolute, 30));
             _numWindow.Minimum = 0.5m; _numWindow.Maximum = 10m; _numWindow.DecimalPlaces = 1;
@@ -618,9 +712,13 @@ namespace MvRawPlayer
             settings.Controls.Add(_numWindow, 1, 0);
             settings.Controls.Add(MakeLabel("최대 분석 주파수 (Hz)"), 0, 1);
             settings.Controls.Add(_numMaxHz, 1, 1);
+            _numScale.Minimum = 0; _numScale.Maximum = 1000; _numScale.DecimalPlaces = 4;
+            _numScale.Increment = 0.01m; _numScale.Value = 0; _numScale.Dock = DockStyle.Fill;
+            settings.Controls.Add(MakeLabel("화면 배율 (mm/픽셀, 0=사용 안 함)"), 0, 2);
+            settings.Controls.Add(_numScale, 1, 2);
 
             _lstRoi.Dock = DockStyle.Top;
-            _lstRoi.Height = 150;
+            _lstRoi.Height = 100;
             _lstRoi.IntegralHeight = false;
             _lstRoi.Font = new Font("Consolas", 10f);
             _lstRoi.SelectedIndexChanged += (s, e) => UpdateAnalysis(true);
@@ -650,12 +748,16 @@ namespace MvRawPlayer
             var help = new Label
             {
                 Dock = DockStyle.Bottom,
-                Height = 58,
+                Height = 50,
                 ForeColor = Color.DimGray,
-                Text = "Shift+드래그 또는 [ROI 지정] 후 드래그로 영역 지정\n영역 우클릭: 삭제 · 최대 8개\n구간이 길수록 주파수 분해능이 좋아집니다",
+                Text = "Shift+드래그 또는 [ROI 지정] 후 드래그로 영역 지정\n영역 우클릭: 삭제 · 최대 8개 · 진폭은 영역마다 물체 1개일 때 정확\n구간이 길수록 주파수 분해능이 좋아집니다",
             };
 
+            _wave.Dock = DockStyle.Bottom;
+            _wave.Height = 110;
+
             panel.Controls.Add(_spec);
+            panel.Controls.Add(_wave);
             panel.Controls.Add(help);
             panel.Controls.Add(settings);
             panel.Controls.Add(_lstRoi);
@@ -714,7 +816,10 @@ namespace MvRawPlayer
             if (_lstRoi.Items.Count > 0 && _lstRoi.SelectedIndex < 0)
                 _lstRoi.SelectedIndex = 0;
             if (_lstRoi.Items.Count == 0)
+            {
                 _spec.Clear();
+                _wave.Clear();
+            }
             _pic.Invalidate();
         }
 
@@ -727,6 +832,7 @@ namespace MvRawPlayer
             _pic.Rois.Clear();
             _lstRoi.Items.Clear();
             _spec.Clear();
+            _wave.Clear();
             _pic.Invalidate();
         }
 
@@ -757,12 +863,29 @@ namespace MvRawPlayer
                 double total;
                 int n = Native.mvp_roi_peaks(_h, it.Slot, hz, st, 4, out total);
                 string txt = "R" + (it.Slot + 1) + "  ";
+                string amp = "";
+                double fshow = n > 0 ? hz[0] : 0;
                 if (n > 0)
                 {
+                    var am = new double[8];
+                    int used = Native.mvp_roi_amp(_h, it.Slot, hz[0], am);
+                    double a = Math.Max(am[0], am[1]);
+                    double r2 = am[0] >= am[1] ? am[5] : am[6];
+                    if (used > 0 && r2 >= 0.1 && Math.Abs(am[7] - hz[0]) <= 1.6)
+                    {
+                        fshow = am[7];
+                        amp = "±" + a.ToString(a < 10 ? "0.0#" : "0.0") + "px" + (am[0] >= am[1] ? " X" : " Y");
+                        double mm = (double)_numScale.Value;
+                        if (mm > 0)
+                            amp += " (" + (a * mm).ToString("0.###") + "mm)";
+                    }
                     var parts = new List<string>();
-                    for (int k = 0; k < Math.Min(n, 3); ++k)
+                    parts.Add(fshow.ToString("0.0"));
+                    for (int k = 1; k < Math.Min(n, 3); ++k)
                         parts.Add(hz[k].ToString("0.0"));
-                    txt += string.Join(" / ", parts.ToArray()) + " Hz";
+                    txt += string.Join("/", parts.ToArray()) + "Hz";
+                    if (amp.Length > 0)
+                        txt += "  " + amp;
                 }
                 else
                 {
@@ -775,7 +898,7 @@ namespace MvRawPlayer
                 }
                 foreach (VideoView.RoiOverlay ro in _pic.Rois)
                     if (ro.Slot == it.Slot)
-                        ro.Label = n > 0 ? "R" + (it.Slot + 1) + " " + hz[0].ToString("0.0") + " Hz" : "R" + (it.Slot + 1);
+                        ro.Label = n > 0 ? "R" + (it.Slot + 1) + " " + fshow.ToString("0.0") + " Hz" + (amp.Length > 0 ? " " + amp.Replace(" X", "").Replace(" Y", "") : "") : "R" + (it.Slot + 1);
             }
             _pic.Invalidate();
 
@@ -794,6 +917,14 @@ namespace MvRawPlayer
                 _spec.SetData(buf, nb, pk, "R" + (cur.Slot + 1) + "  주파수 분포 (표본 " + ((long)total2) + ")",
                     RoiColors[cur.Slot % RoiColors.Length]);
             }
+            var tx = new float[800]; var vx = new float[800]; var ty = new float[800]; var vy = new float[800];
+            double wms, wms2;
+            int nx = Native.mvp_roi_series(_h, cur.Slot, 0, 800, tx, vx, out wms);
+            int ny = Native.mvp_roi_series(_h, cur.Slot, 1, 800, ty, vy, out wms2);
+            if (nx > 1)
+                _wave.SetData(tx, vx, nx, ty, vy, Math.Max(0, ny), wms, (double)_numScale.Value);
+            else
+                _wave.Clear();
         }
 
 
