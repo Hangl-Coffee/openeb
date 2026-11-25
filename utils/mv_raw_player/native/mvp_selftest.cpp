@@ -1,5 +1,6 @@
 // Headless end-to-end check of the player library (open, play, pause, speed, seek, loop, end).
 #include <chrono>
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -23,6 +24,8 @@ void mvp_an_config(void *, int, int);
 void mvp_roi_set(void *, int, int, int, int, int);
 void mvp_roi_clear_all(void *);
 int mvp_roi_peaks(void *, int, double *, double *, int, double *);
+int mvp_roi_amp(void *, int, double, double *);
+int mvp_roi_series(void *, int, int, int, float *, float *, double *);
 }
 
 static int lit(const std::vector<uint8_t> &f) {
@@ -147,6 +150,26 @@ int main(int argc, char **argv) {
         n = mvp_roi_peaks(v, 1, hz, st, 8, &total);
         std::printf("ROI1: %d peaks, total=%.0f, first=%.2f Hz\n", n, total, n > 0 ? hz[0] : -1.0);
         CHECK(n >= 1 && std::fabs(hz[0] - 50.0) < 1.5, "ROI1 dominant frequency is 50 Hz");
+
+        double am[8];
+        int nu = mvp_roi_amp(v, 0, 40.0, am);
+        std::printf("ROI0 amp: used=%d Ax=%.2f Ay=%.2f f=%.2f R2x=%.2f\n", nu, am[0], am[1], am[7], am[5]);
+        CHECK(nu > 100 && std::fabs(am[0] - 10.0) < 1.5 && am[1] < 1.0, "ROI0 amplitude is ~10 px along X");
+        CHECK(std::fabs(am[7] - 40.0) < 0.3, "ROI0 refined frequency is 40.0 Hz");
+        nu = mvp_roi_amp(v, 1, 50.3, am);
+        std::printf("ROI1 amp: used=%d Ax=%.2f Ay=%.2f f=%.2f R2x=%.2f\n", nu, am[0], am[1], am[7], am[5]);
+        CHECK(nu > 100 && std::fabs(am[0] - 10.0) < 1.5 && am[1] < 1.0, "ROI1 amplitude is ~10 px along X");
+        CHECK(std::fabs(am[7] - 50.0) < 0.3, "ROI1 refined frequency is 50.0 Hz (from a 0.3 Hz off start)");
+        CHECK(mvp_roi_amp(v, 3, 40.0, am) == 0, "empty ROI has no amplitude");
+        {
+            std::vector<float> tt(2000), vv(2000);
+            double wms = 0;
+            int ns = mvp_roi_series(v, 0, 0, 2000, tt.data(), vv.data(), &wms);
+            float mn = 1e9f, mxv = -1e9f;
+            for (int i = 0; i < ns; ++i) { mn = std::min(mn, vv[i]); mxv = std::max(mxv, vv[i]); }
+            std::printf("ROI0 series: %d samples, window %.0f ms, range %.1f..%.1f px\n", ns, wms, mn, mxv);
+            CHECK(ns > 100 && (mxv - mn) > 14.0 && (mxv - mn) < 24.0, "ROI0 displacement waveform spans ~20 px peak-to-peak");
+        }
 
         n = mvp_roi_peaks(v, 2, hz, st, 8, &total);
         bool f40 = false, f50 = false;
