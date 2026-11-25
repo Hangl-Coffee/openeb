@@ -562,11 +562,11 @@ MVP_API int mvp_roi_peaks(void *h, int idx, double *hz, double *strength, int ma
     std::sort(pk.begin(), pk.end(), [](const Pk &a, const Pk &b) { return a.str > b.str; });
     std::vector<Pk> sel;
     for (const Pk &q : pk) {
-        bool near = false;
+        bool dup = false;
         for (const Pk &s2 : sel)
             if (std::fabs(s2.hz - q.hz) < 3.5)
-                near = true;
-        if (!near)
+                dup = true;
+        if (!dup)
             sel.push_back(q);
     }
     const int k = std::min<int>(max_n, static_cast<int>(sel.size()));
