@@ -97,12 +97,14 @@ jobs:
         shell: bash
         run: |
           python utils/mv_raw_player/tools/gen_raw.py test.raw 6
+          python utils/mv_raw_player/tools/gen_vib.py vib.raw 4
           PLUG="$(find dist -iname '*hal_plugin*.dll' | head -1)"
           echo "plugin dll: $PLUG"
           test -n "$PLUG"
           export MV_HAL_PLUGIN_PATH="$(cd "$(dirname "$PLUG")" && pwd -W)"
           export PATH="$(pwd):$(pwd)/dist/bin:$PATH"
-          ./dist/bin/mvp_selftest.exe test.raw
+          ./dist/bin/mvp_selftest.exe test.raw vib.raw
+          cp vib.raw dist/sample_vibration_40Hz_50Hz.raw
 
       - name: Build WinForms app (MvRawPlayer.exe)
         shell: bash
