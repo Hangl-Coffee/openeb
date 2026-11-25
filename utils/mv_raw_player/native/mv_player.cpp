@@ -52,6 +52,10 @@ struct Analysis {
         int x0 = 0, y0 = 0, x1 = 0, y1 = 0; // x1/y1 exclusive
         std::vector<float> ring;             // n_slices * (max_hz + 1)
         std::vector<int64_t> slice_id;       // absolute slice index stored in every ring slot
+        // event-centroid time series (position of the vibrating object over time)
+        std::vector<double> bsx, bsy;        // sum of x / y of the events of every time bin
+        std::vector<float> bn;               // number of events of every time bin
+        std::vector<int64_t> bid;            // absolute bin index stored in every ring slot
     };
 
     std::mutex m;
@@ -61,6 +65,8 @@ struct Analysis {
     int64_t slice_us = 100000;
     int n_slices = 10;
     int64_t burst_us = 500;
+    int64_t bin_us = 250;      // time bin of the centroid series
+    int n_bins = 4000;         // ring size (bins) of the centroid series
     int64_t latest = kNever;
     std::vector<int64_t> last_start[2];
     std::vector<int64_t> last_ev[2];
@@ -79,6 +85,10 @@ struct Analysis {
     void clear_roi_hist_locked(Roi &r) {
         r.ring.assign(static_cast<size_t>(n_slices) * bins(), 0.f);
         r.slice_id.assign(n_slices, kNever);
+        r.bsx.assign(n_bins, 0.0);
+        r.bsy.assign(n_bins, 0.0);
+        r.bn.assign(n_bins, 0.f);
+        r.bid.assign(n_bins, kNever);
     }
     void reset_state() {
         std::lock_guard<std::mutex> l(m);
@@ -93,6 +103,11 @@ struct Analysis {
         max_hz   = std::max(50, std::min(5000, hz));
         n_slices = std::max(2, std::min(100, window_ms / 100));
         burst_us = std::max<int64_t>(50, 250000 / max_hz);
+        const int64_t window_us = static_cast<int64_t>(n_slices) * slice_us;
+        bin_us = std::max<int64_t>(50, std::min<int64_t>(1000, 1000000 / (8 * max_hz)));
+        if (window_us / bin_us > 20000)
+            bin_us = window_us / 20000;
+        n_bins = static_cast<int>(window_us / bin_us) + 2;
         if (nactive.load() > 0)
             alloc_state_locked();
         for (auto &r : roi)
@@ -112,6 +127,7 @@ struct Analysis {
             r.active = false;
             r.ring.clear();
             r.slice_id.clear();
+            r.bsx.clear(); r.bsy.clear(); r.bn.clear(); r.bid.clear();
         } else {
             r.active = true;
             r.x0 = x0; r.y0 = y0; r.x1 = x1; r.y1 = y1;
@@ -155,6 +171,22 @@ struct Analysis {
         const int64_t t = e.t;
         if (t > latest)
             latest = t;
+        {
+            const int64_t id = t / bin_us;
+            const int slot = static_cast<int>(((id % n_bins) + n_bins) % n_bins);
+            for (int j = 0; j < nh; ++j) {
+                Roi &r = roi[hit[j]];
+                if (r.bid[slot] != id) {
+                    r.bid[slot] = id;
+                    r.bsx[slot] = 0;
+                    r.bsy[slot] = 0;
+                    r.bn[slot]  = 0;
+                }
+                r.bsx[slot] += e.x + 0.5;
+                r.bsy[slot] += e.y + 0.5;
+                r.bn[slot] += 1.f;
+            }
+        }
         const int64_t le = last_ev[q][i];
         if (le == kNever || t - le > burst_us) {
             const int64_t prev = last_start[q][i];
@@ -181,6 +213,26 @@ struct Analysis {
             const float *src = r.ring.data() + static_cast<size_t>(s) * bins();
             for (int b = 0; b < bins(); ++b)
                 out[b] += src[b];
+        }
+    }
+
+    struct Pt { double t, x, y, w; }; // t in seconds from the window start
+    // centroid series of the sliding window (bins with enough events); caller holds m
+    void window_series_locked(const Roi &r, std::vector<Pt> &out, double &window_s) const {
+        out.clear();
+        window_s = 0;
+        if (latest == kNever || r.bid.empty())
+            return;
+        const int64_t cur = latest / bin_us;
+        const int64_t wb  = static_cast<int64_t>(n_slices) * slice_us / bin_us;
+        window_s = static_cast<double>(wb * bin_us) * 1e-6;
+        const int64_t first = cur - wb + 1;
+        for (int64_t id = first; id <= cur; ++id) {
+            const int slot = static_cast<int>(((id % n_bins) + n_bins) % n_bins);
+            if (r.bid[slot] != id || r.bn[slot] < 6.f)
+                continue;
+            const double n = r.bn[slot];
+            out.push_back({(static_cast<double>(id - first) + 0.5) * bin_us * 1e-6, r.bsx[slot] / n, r.bsy[slot] / n, n});
         }
     }
 };
@@ -573,6 +625,130 @@ MVP_API int mvp_roi_peaks(void *h, int idx, double *hz, double *strength, int ma
     for (int i = 0; i < k; ++i) {
         hz[i]       = sel[i].hz;
         strength[i] = sel[i].str;
+    }
+    return k;
+}
+
+// Amplitude of the vibration of ROI idx at (about) f0 Hz, measured on the event-centroid track:
+// a weighted sinusoid fit  p(t) = a + b cos(wt) + c sin(wt)  is evaluated for f0-1.5 .. f0+1.5 Hz and the
+// best frequency is kept.  out[0],out[1] = amplitude (zero-to-peak, pixels) along X / Y, out[2],out[3] =
+// mean position, out[4] = bins used, out[5],out[6] = R^2 of the X / Y fit, out[7] = refined frequency.
+// Returns the number of bins used (0 if there is not enough data), or -1 if the ROI is not active.
+MVP_API int mvp_roi_amp(void *h, int idx, double f0, double *out) {
+    Player *p = static_cast<Player *>(h);
+    if (idx < 0 || idx >= Analysis::kMaxRoi)
+        return -1;
+    std::vector<Analysis::Pt> pts;
+    double win = 0;
+    {
+        std::lock_guard<std::mutex> l(p->an.m);
+        const Analysis::Roi &r = p->an.roi[idx];
+        if (!r.active)
+            return -1;
+        p->an.window_series_locked(r, pts, win);
+    }
+    for (int i = 0; i < 8; ++i)
+        out[i] = 0;
+    const int n = static_cast<int>(pts.size());
+    if (n < 30 || f0 <= 0)
+        return 0;
+    double sw = 0, mx = 0, my = 0;
+    for (const auto &q : pts) {
+        sw += q.w;
+        mx += q.w * q.x;
+        my += q.w * q.y;
+    }
+    mx /= sw;
+    my /= sw;
+    double vx = 0, vy = 0;
+    for (const auto &q : pts) {
+        vx += q.w * (q.x - mx) * (q.x - mx);
+        vy += q.w * (q.y - my) * (q.y - my);
+    }
+    const double two_pi = 6.283185307179586;
+    double best = -1, bf = f0, bAx = 0, bAy = 0, bR2x = 0, bR2y = 0;
+    for (int k = -15; k <= 15; ++k) {
+        const double f = f0 + 0.1 * k;
+        if (f <= 0)
+            continue;
+        const double w = two_pi * f;
+        // normal equations of the weighted fit of [1, cos, sin] (centred data -> a ~ 0)
+        double Scc = 0, Sss = 0, Scs = 0, Sc = 0, Ss = 0, S1 = 0;
+        double bx_c = 0, bx_s = 0, bx_1 = 0, by_c = 0, by_s = 0, by_1 = 0;
+        for (const auto &q : pts) {
+            const double c = std::cos(w * q.t), s = std::sin(w * q.t);
+            S1 += q.w; Sc += q.w * c; Ss += q.w * s;
+            Scc += q.w * c * c; Sss += q.w * s * s; Scs += q.w * c * s;
+            bx_1 += q.w * (q.x - mx); bx_c += q.w * (q.x - mx) * c; bx_s += q.w * (q.x - mx) * s;
+            by_1 += q.w * (q.y - my); by_c += q.w * (q.y - my) * c; by_s += q.w * (q.y - my) * s;
+        }
+        // solve [S1 Sc Ss; Sc Scc Scs; Ss Scs Sss] * [a b c]^T = rhs (Cramer)
+        auto det3 = [](double a, double b, double c, double d, double e, double f2, double g, double h2, double i) {
+            return a * (e * i - f2 * h2) - b * (d * i - f2 * g) + c * (d * h2 - e * g);
+        };
+        const double D = det3(S1, Sc, Ss, Sc, Scc, Scs, Ss, Scs, Sss);
+        if (std::fabs(D) < 1e-12)
+            continue;
+        auto solve = [&](double r1, double rc, double rs, double &b, double &c) {
+            b = det3(S1, r1, Ss, Sc, rc, Scs, Ss, rs, Sss) / D;
+            c = det3(S1, Sc, r1, Sc, Scc, rc, Ss, Scs, rs) / D;
+        };
+        double bxv, cxv, byv, cyv;
+        solve(bx_1, bx_c, bx_s, bxv, cxv);
+        solve(by_1, by_c, by_s, byv, cyv);
+        const double Ax = std::sqrt(bxv * bxv + cxv * cxv), Ay = std::sqrt(byv * byv + cyv * cyv);
+        const double sc2   = Ax * Ax + Ay * Ay;
+        if (sc2 > best) {
+            best = sc2;
+            bf   = f;
+            bAx  = Ax;
+            bAy  = Ay;
+            bR2x = vx > 0 ? std::min(1.0, 0.5 * Ax * Ax * sw / vx) : 0;
+            bR2y = vy > 0 ? std::min(1.0, 0.5 * Ay * Ay * sw / vy) : 0;
+        }
+    }
+    out[0] = bAx;
+    out[1] = bAy;
+    out[2] = mx;
+    out[3] = my;
+    out[4] = n;
+    out[5] = bR2x;
+    out[6] = bR2y;
+    out[7] = bf;
+    return n;
+}
+
+// Displacement waveform of ROI idx: axis 0 = X, 1 = Y.  t_ms = time since the start of the window,
+// val = position minus its mean (pixels).  Returns the number of samples written (<= max_n).
+MVP_API int mvp_roi_series(void *h, int idx, int axis, int max_n, float *t_ms, float *val, double *window_ms) {
+    Player *p = static_cast<Player *>(h);
+    if (idx < 0 || idx >= Analysis::kMaxRoi)
+        return -1;
+    std::vector<Analysis::Pt> pts;
+    double win = 0;
+    {
+        std::lock_guard<std::mutex> l(p->an.m);
+        const Analysis::Roi &r = p->an.roi[idx];
+        if (!r.active)
+            return -1;
+        p->an.window_series_locked(r, pts, win);
+    }
+    if (window_ms)
+        *window_ms = win * 1000.0;
+    if (pts.empty())
+        return 0;
+    double sw = 0, m = 0;
+    for (const auto &q : pts) {
+        sw += q.w;
+        m += q.w * (axis ? q.y : q.x);
+    }
+    m /= sw;
+    const int n = static_cast<int>(pts.size());
+    const int stride = std::max(1, (n + max_n - 1) / max_n);
+    int k = 0;
+    for (int i = 0; i < n && k < max_n; i += stride, ++k) {
+        t_ms[k] = static_cast<float>(pts[i].t * 1000.0);
+        val[k]  = static_cast<float>((axis ? pts[i].y : pts[i].x) - m);
     }
     return k;
 }
