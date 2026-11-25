@@ -1,5 +1,6 @@
 // Headless end-to-end check of the player library (open, play, pause, speed, seek, loop, end).
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <thread>
@@ -18,6 +19,10 @@ int mvp_is_ended(void *);
 int mvp_seek(void *, int64_t);
 int64_t mvp_get_position_us(void *);
 void mvp_render_bgra(void *, uint8_t *, int);
+void mvp_an_config(void *, int, int);
+void mvp_roi_set(void *, int, int, int, int, int);
+void mvp_roi_clear_all(void *);
+int mvp_roi_peaks(void *, int, double *, double *, int, double *);
 }
 
 static int lit(const std::vector<uint8_t> &f) {
@@ -39,7 +44,7 @@ static void sleep_ms(int ms) { std::this_thread::sleep_for(std::chrono::millisec
 
 int main(int argc, char **argv) {
     if (argc < 2) {
-        std::printf("usage: mvp_selftest file.raw\n");
+        std::printf("usage: mvp_selftest file.raw [vibration.raw]\n");
         return 2;
     }
     int w = 0, h = 0;
@@ -111,6 +116,56 @@ int main(int argc, char **argv) {
     CHECK(wrapped, "loop wraps to start");
 
     mvp_close(p);
+
+    if (argc > 2) {
+        // ---- ROI vibration analysis on the synthetic 40 Hz / 50 Hz recording ----
+        int vw = 0, vh = 0;
+        int64_t v0 = 0, v1 = 0;
+        void *v = mvp_open(argv[2], &vw, &vh, &v0, &v1);
+        if (!v) {
+            std::printf("FAIL: open vibration file: %s\n", mvp_last_error());
+            return 1;
+        }
+        mvp_set_loop(v, 0);
+        mvp_set_playing(v, 0);
+        mvp_seek(v, v0);
+        mvp_an_config(v, 500, 1000);
+        mvp_roi_set(v, 0, 140, 90, 180, 140);  // bar A: 40 Hz
+        mvp_roi_set(v, 1, 460, 290, 500, 340); // bar B: 50 Hz
+        mvp_roi_set(v, 2, 0, 0, vw, vh);       // whole sensor: both
+        mvp_roi_set(v, 3, 300, 200, 360, 260); // empty area
+        mvp_set_speed(v, 40.0);
+        mvp_set_playing(v, 1);
+        for (int i = 0; i < 300 && !mvp_is_ended(v); ++i) sleep_ms(100);
+        CHECK(mvp_is_ended(v), "vibration file played to the end");
+
+        double hz[8], st[8], total = 0;
+        int n = mvp_roi_peaks(v, 0, hz, st, 8, &total);
+        std::printf("ROI0: %d peaks, total=%.0f, first=%.2f Hz\n", n, total, n > 0 ? hz[0] : -1.0);
+        CHECK(n >= 1 && std::fabs(hz[0] - 40.0) < 1.5, "ROI0 dominant frequency is 40 Hz");
+
+        n = mvp_roi_peaks(v, 1, hz, st, 8, &total);
+        std::printf("ROI1: %d peaks, total=%.0f, first=%.2f Hz\n", n, total, n > 0 ? hz[0] : -1.0);
+        CHECK(n >= 1 && std::fabs(hz[0] - 50.0) < 1.5, "ROI1 dominant frequency is 50 Hz");
+
+        n = mvp_roi_peaks(v, 2, hz, st, 8, &total);
+        bool f40 = false, f50 = false;
+        for (int i = 0; i < n; ++i) {
+            std::printf("ROI2 peak %d: %.2f Hz (%.0f samples)\n", i, hz[i], st[i]);
+            if (std::fabs(hz[i] - 40.0) < 1.5) f40 = true;
+            if (std::fabs(hz[i] - 50.0) < 1.5) f50 = true;
+        }
+        CHECK(f40 && f50, "whole-frame ROI shows both 40 Hz and 50 Hz peaks");
+
+        n = mvp_roi_peaks(v, 3, hz, st, 8, &total);
+        std::printf("ROI3 (empty): %d peaks, total=%.0f\n", n, total);
+        CHECK(n <= 0, "empty ROI has no vibration peak");
+
+        mvp_roi_clear_all(v);
+        CHECK(mvp_roi_peaks(v, 0, hz, st, 8, &total) < 0, "ROI removed");
+        mvp_close(v);
+    }
+
     std::printf("ALL OK\n");
     return 0;
 }
