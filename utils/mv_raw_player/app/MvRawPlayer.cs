@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Drawing.Imaging;
@@ -114,6 +115,22 @@ namespace MvRawPlayer
 
         [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
         public static extern void mvp_render_bgra(IntPtr h, IntPtr dst, int stride);
+
+        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void mvp_an_config(IntPtr h, int maxHz, int windowMs);
+
+        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void mvp_roi_set(IntPtr h, int idx, int x0, int y0, int x1, int y1);
+
+        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void mvp_roi_clear_all(IntPtr h);
+
+        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+        public static extern int mvp_roi_hist(IntPtr h, int idx, [In, Out] float[] buf, int n);
+
+        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+        public static extern int mvp_roi_peaks(IntPtr h, int idx, [In, Out] double[] hz, [In, Out] double[] strength,
+            int maxN, out double total);
     }
 
     /// <summary>Video surface with mouse-wheel zoom (around the cursor), drag panning and double-click reset.</summary>
@@ -121,6 +138,33 @@ namespace MvRawPlayer
     {
         private const double MinZoom = 0.25;
         private const double MaxZoom = 64.0;
+
+        /// <summary>A region of interest shown on top of the video (image coordinates, right/bottom exclusive).</summary>
+        internal sealed class RoiOverlay
+        {
+            public Rectangle R;
+            public string Label = "";
+            public Color Color = Color.Lime;
+            public int Slot;
+        }
+
+        public readonly List<RoiOverlay> Rois = new List<RoiOverlay>();
+        public event Action<Rectangle> RoiDrawn;
+        public event Action<int> RoiRemoveRequested;
+
+        private bool _roiMode;
+        private bool _roiDraw;
+        private Point _roiA, _roiB;
+
+        public bool RoiMode
+        {
+            get { return _roiMode; }
+            set
+            {
+                _roiMode = value;
+                Cursor = value ? Cursors.Cross : Cursors.Default;
+            }
+        }
 
         private Image _image;
         private double _zoom = 1.0;          // 1.0 = fit to window
@@ -194,6 +238,29 @@ namespace MvRawPlayer
             Invalidate();
         }
 
+        private void GetMapping(out double ox, out double oy, out double scale)
+        {
+            scale = FitScale() * _zoom;
+            ox = ClientSize.Width / 2.0 + _panX - _image.Width * scale / 2.0;
+            oy = ClientSize.Height / 2.0 + _panY - _image.Height * scale / 2.0;
+        }
+
+        private Point ViewToImage(Point pt)
+        {
+            double ox, oy, sc;
+            GetMapping(out ox, out oy, out sc);
+            int x = (int)Math.Round((pt.X - ox) / sc);
+            int y = (int)Math.Round((pt.Y - oy) / sc);
+            return new Point(Math.Max(0, Math.Min(_image.Width, x)), Math.Max(0, Math.Min(_image.Height, y)));
+        }
+
+        private PointF ImageToView(double x, double y)
+        {
+            double ox, oy, sc;
+            GetMapping(out ox, out oy, out sc);
+            return new PointF((float)(ox + x * sc), (float)(oy + y * sc));
+        }
+
         private void ClampPan()
         {
             if (_image == null)
@@ -208,7 +275,31 @@ namespace MvRawPlayer
         protected override void OnMouseDown(MouseEventArgs e)
         {
             base.OnMouseDown(e);
-            if (e.Button == MouseButtons.Left && _image != null)
+            if (_image == null)
+                return;
+            if (e.Button == MouseButtons.Right)
+            {
+                Point ip = ViewToImage(e.Location);
+                for (int i = Rois.Count - 1; i >= 0; --i)
+                {
+                    if (Rois[i].R.Contains(ip))
+                    {
+                        Action<int> h = RoiRemoveRequested;
+                        if (h != null)
+                            h(Rois[i].Slot);
+                        break;
+                    }
+                }
+                return;
+            }
+            if (e.Button == MouseButtons.Left && (_roiMode || (ModifierKeys & Keys.Shift) != 0))
+            {
+                _roiDraw = true;
+                _roiA = _roiB = ViewToImage(e.Location);
+                Invalidate();
+                return;
+            }
+            if (e.Button == MouseButtons.Left)
             {
                 _panning = true;
                 _panStart = e.Location;
@@ -221,6 +312,12 @@ namespace MvRawPlayer
         protected override void OnMouseMove(MouseEventArgs e)
         {
             base.OnMouseMove(e);
+            if (_roiDraw)
+            {
+                _roiB = ViewToImage(e.Location);
+                Invalidate();
+                return;
+            }
             if (_panning)
             {
                 _panX = _panStartX + (e.X - _panStart.X);
@@ -233,8 +330,19 @@ namespace MvRawPlayer
         protected override void OnMouseUp(MouseEventArgs e)
         {
             base.OnMouseUp(e);
+            if (_roiDraw)
+            {
+                _roiDraw = false;
+                var r = new Rectangle(Math.Min(_roiA.X, _roiB.X), Math.Min(_roiA.Y, _roiB.Y),
+                    Math.Abs(_roiB.X - _roiA.X), Math.Abs(_roiB.Y - _roiA.Y));
+                Invalidate();
+                Action<Rectangle> h = RoiDrawn;
+                if (h != null && r.Width >= 4 && r.Height >= 4)
+                    h(r);
+                return;
+            }
             _panning = false;
-            Cursor = Cursors.Default;
+            Cursor = _roiMode ? Cursors.Cross : Cursors.Default;
         }
 
         protected override void OnDoubleClick(EventArgs e)
@@ -263,6 +371,29 @@ namespace MvRawPlayer
             g.PixelOffsetMode = PixelOffsetMode.Half;
             g.DrawImage(_image, new RectangleF((float)x, (float)y, (float)w, (float)h));
 
+            using (var lf = new Font("Segoe UI", 9f, FontStyle.Bold))
+            {
+                foreach (RoiOverlay ro in Rois)
+                {
+                    PointF a = ImageToView(ro.R.Left, ro.R.Top);
+                    PointF b = ImageToView(ro.R.Right, ro.R.Bottom);
+                    using (var pen = new Pen(ro.Color, 2f))
+                        g.DrawRectangle(pen, a.X, a.Y, b.X - a.X, b.Y - a.Y);
+                    SizeF ls = g.MeasureString(ro.Label, lf);
+                    using (var bb = new SolidBrush(Color.FromArgb(170, 0, 0, 0)))
+                        g.FillRectangle(bb, a.X, a.Y - ls.Height, ls.Width, ls.Height);
+                    using (var tb = new SolidBrush(ro.Color))
+                        g.DrawString(ro.Label, lf, tb, a.X, a.Y - ls.Height);
+                }
+            }
+            if (_roiDraw)
+            {
+                PointF a = ImageToView(Math.Min(_roiA.X, _roiB.X), Math.Min(_roiA.Y, _roiB.Y));
+                PointF b = ImageToView(Math.Max(_roiA.X, _roiB.X), Math.Max(_roiA.Y, _roiB.Y));
+                using (var pen = new Pen(Color.White, 1f) { DashStyle = DashStyle.Dash })
+                    g.DrawRectangle(pen, a.X, a.Y, b.X - a.X, b.Y - a.Y);
+            }
+
             string label = string.Format("{0:0.##}x  ({1}%)", _zoom, (int)Math.Round(scale * 100.0));
             using (var f = new Font("Segoe UI", 9f))
             {
@@ -270,6 +401,103 @@ namespace MvRawPlayer
                 using (var b = new SolidBrush(Color.FromArgb(150, 0, 0, 0)))
                     g.FillRectangle(b, 6, 6, sz.Width + 8, sz.Height + 2);
                 g.DrawString(label, f, Brushes.Gainsboro, 10, 7);
+            }
+        }
+    }
+
+    /// <summary>Frequency histogram of one ROI with peak markers.</summary>
+    internal sealed class SpectrumView : Control
+    {
+        private float[] _h = new float[0];
+        private double[] _pk = new double[0];
+        private string _title = "";
+        private Color _color = Color.Lime;
+
+        public SpectrumView()
+        {
+            SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint |
+                     ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
+            BackColor = Color.FromArgb(24, 26, 30);
+        }
+
+        public void SetData(float[] hist, int n, double[] peaks, string title, Color color)
+        {
+            _h = new float[Math.Max(0, n)];
+            Array.Copy(hist, _h, _h.Length);
+            _pk = peaks;
+            _title = title;
+            _color = color;
+            Invalidate();
+        }
+
+        public void Clear()
+        {
+            _h = new float[0];
+            _pk = new double[0];
+            _title = "";
+            Invalidate();
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            Graphics g = e.Graphics;
+            g.Clear(BackColor);
+            var plot = new Rectangle(34, 24, Math.Max(10, Width - 44), Math.Max(10, Height - 24 - 24));
+            using (var f = new Font("Segoe UI", 8.5f))
+            using (var fb = new Font("Segoe UI", 9f, FontStyle.Bold))
+            {
+                g.DrawString(_title.Length > 0 ? _title : "ROI를 지정하면 주파수 스펙트럼이 표시됩니다", fb,
+                    Brushes.Gainsboro, 4, 3);
+                using (var axis = new Pen(Color.FromArgb(90, 95, 105)))
+                    g.DrawRectangle(axis, plot);
+                int n = _h.Length;
+                if (n < 3)
+                    return;
+                int maxHz = n - 1;
+                double step = 50;
+                while (maxHz / step > 10) step *= 2;
+                while (maxHz / step < 4 && step > 10) step /= 2;
+                for (double hz = 0; hz <= maxHz + 0.01; hz += step)
+                {
+                    float x = plot.Left + (float)(hz / maxHz * plot.Width);
+                    using (var gp = new Pen(Color.FromArgb(45, 50, 58)))
+                        g.DrawLine(gp, x, plot.Top, x, plot.Bottom);
+                    string t = hz.ToString("0");
+                    SizeF ts = g.MeasureString(t, f);
+                    g.DrawString(t, f, Brushes.Silver, x - ts.Width / 2, plot.Bottom + 2);
+                }
+                g.DrawString("Hz", f, Brushes.Silver, 4, plot.Bottom + 2);
+
+                float max = 1f;
+                for (int i = 1; i < n; ++i)
+                    if (_h[i] > max) max = _h[i];
+                using (var br = new SolidBrush(Color.FromArgb(170, _color)))
+                {
+                    for (int px = 0; px < plot.Width; ++px)
+                    {
+                        int b0 = 1 + (int)((long)px * (n - 1) / plot.Width);
+                        int b1 = Math.Max(b0, 1 + (int)((long)(px + 1) * (n - 1) / plot.Width) - 1);
+                        float v = 0;
+                        for (int b = b0; b <= b1 && b < n; ++b)
+                            if (_h[b] > v) v = _h[b];
+                        int hgt = (int)(v / max * (plot.Height - 4));
+                        if (hgt > 0)
+                            g.FillRectangle(br, plot.Left + px, plot.Bottom - hgt, 1, hgt);
+                    }
+                }
+                int k = 0;
+                foreach (double hz in _pk)
+                {
+                    float x = plot.Left + (float)(hz / maxHz * plot.Width);
+                    using (var pp = new Pen(Color.Yellow, 1f) { DashStyle = DashStyle.Dot })
+                        g.DrawLine(pp, x, plot.Top, x, plot.Bottom);
+                    string t = hz.ToString("0.0") + " Hz";
+                    SizeF ts = g.MeasureString(t, f);
+                    float tx = Math.Min(Math.Max(plot.Left, x - ts.Width / 2), plot.Right - ts.Width);
+                    g.DrawString(t, f, Brushes.Yellow, tx, plot.Top + 2 + (k % 3) * 13);
+                    if (++k >= 3) break;
+                }
+                g.DrawString("빈도", f, Brushes.Silver, 2, plot.Top);
             }
         }
     }
@@ -308,6 +536,28 @@ namespace MvRawPlayer
         private readonly Label _lblAcc = new Label();
         private readonly Timer _timer = new Timer();
 
+        // ROI vibration analysis
+        private sealed class RoiItem
+        {
+            public int Slot;
+            public string Text = "";
+            public override string ToString() { return Text; }
+        }
+        private const int MaxRoi = 8;
+        private static readonly Color[] RoiColors =
+        {
+            Color.Lime, Color.Cyan, Color.Orange, Color.Magenta, Color.Yellow, Color.DeepSkyBlue, Color.Tomato, Color.White
+        };
+        private readonly Rectangle[] _roiRect = new Rectangle[MaxRoi];
+        private readonly bool[] _roiUsed = new bool[MaxRoi];
+        private readonly ListBox _lstRoi = new ListBox();
+        private readonly SpectrumView _spec = new SpectrumView();
+        private readonly CheckBox _chkRoiMode = new CheckBox();
+        private readonly Button _btnRoiClear = new Button();
+        private readonly NumericUpDown _numWindow = new NumericUpDown();
+        private readonly NumericUpDown _numMaxHz = new NumericUpDown();
+        private int _anTick;
+
         private bool _dragging;
         private long _pendingSeekUs = long.MinValue;
         private DateTime _lastSeek = DateTime.MinValue;
@@ -317,8 +567,8 @@ namespace MvRawPlayer
             AutoScaleDimensions = new SizeF(96F, 96F);
             AutoScaleMode = AutoScaleMode.Dpi;
             Text = "MV RAW Player";
-            ClientSize = new Size(1100, 760);
-            MinimumSize = new Size(760, 520);
+            ClientSize = new Size(1380, 780);
+            MinimumSize = new Size(980, 560);
             StartPosition = FormStartPosition.CenterScreen;
             Font = new Font("Segoe UI", 9f);
             AllowDrop = true;
@@ -343,6 +593,209 @@ namespace MvRawPlayer
         }
 
         // ------------------------------------------------------------------ UI construction
+
+        private Control BuildAnalysisPanel()
+        {
+            var panel = new Panel { Dock = DockStyle.Right, Width = 360, Padding = new Padding(6, 4, 6, 6) };
+
+            _pic.RoiDrawn += OnRoiDrawn;
+            _pic.RoiRemoveRequested += RemoveRoi;
+
+            _spec.Dock = DockStyle.Fill;
+
+            var settings = new TableLayoutPanel { Dock = DockStyle.Bottom, Height = 62, ColumnCount = 2, RowCount = 2 };
+            settings.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            settings.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 90));
+            settings.RowStyles.Add(new RowStyle(SizeType.Absolute, 30));
+            settings.RowStyles.Add(new RowStyle(SizeType.Absolute, 30));
+            _numWindow.Minimum = 0.5m; _numWindow.Maximum = 10m; _numWindow.DecimalPlaces = 1;
+            _numWindow.Increment = 0.5m; _numWindow.Value = 1.0m; _numWindow.Dock = DockStyle.Fill;
+            _numMaxHz.Minimum = 100; _numMaxHz.Maximum = 2000; _numMaxHz.Increment = 100;
+            _numMaxHz.Value = 500; _numMaxHz.Dock = DockStyle.Fill;
+            _numWindow.ValueChanged += (s, e) => ApplyAnalysisConfig();
+            _numMaxHz.ValueChanged += (s, e) => ApplyAnalysisConfig();
+            settings.Controls.Add(MakeLabel("분석 구간 길이 (초)"), 0, 0);
+            settings.Controls.Add(_numWindow, 1, 0);
+            settings.Controls.Add(MakeLabel("최대 분석 주파수 (Hz)"), 0, 1);
+            settings.Controls.Add(_numMaxHz, 1, 1);
+
+            _lstRoi.Dock = DockStyle.Top;
+            _lstRoi.Height = 150;
+            _lstRoi.IntegralHeight = false;
+            _lstRoi.Font = new Font("Consolas", 10f);
+            _lstRoi.SelectedIndexChanged += (s, e) => UpdateAnalysis(true);
+
+            var bar = new FlowLayoutPanel { Dock = DockStyle.Top, Height = 38, WrapContents = false };
+            _chkRoiMode.Text = "▭ ROI 지정";
+            _chkRoiMode.Appearance = Appearance.Button;
+            _chkRoiMode.TextAlign = ContentAlignment.MiddleCenter;
+            _chkRoiMode.Width = 110;
+            _chkRoiMode.Height = 30;
+            _chkRoiMode.CheckedChanged += (s, e) => _pic.RoiMode = _chkRoiMode.Checked;
+            _btnRoiClear.Text = "모두 지우기";
+            _btnRoiClear.Width = 100;
+            _btnRoiClear.Height = 30;
+            _btnRoiClear.Click += (s, e) => ClearRois();
+            bar.Controls.Add(_chkRoiMode);
+            bar.Controls.Add(_btnRoiClear);
+
+            var title = new Label
+            {
+                Dock = DockStyle.Top,
+                Height = 26,
+                Text = "진동 분석 (ROI별 주파수)",
+                Font = new Font("Segoe UI", 10f, FontStyle.Bold),
+                TextAlign = ContentAlignment.MiddleLeft,
+            };
+            var help = new Label
+            {
+                Dock = DockStyle.Bottom,
+                Height = 58,
+                ForeColor = Color.DimGray,
+                Text = "Shift+드래그 또는 [ROI 지정] 후 드래그로 영역 지정\n영역 우클릭: 삭제 · 최대 8개\n구간이 길수록 주파수 분해능이 좋아집니다",
+            };
+
+            panel.Controls.Add(_spec);
+            panel.Controls.Add(help);
+            panel.Controls.Add(settings);
+            panel.Controls.Add(_lstRoi);
+            panel.Controls.Add(bar);
+            panel.Controls.Add(title);
+            return panel;
+        }
+
+        // ---- ROI vibration analysis ----
+
+        private void ApplyAnalysisConfig()
+        {
+            if (_h != IntPtr.Zero)
+                Native.mvp_an_config(_h, (int)_numMaxHz.Value, (int)(_numWindow.Value * 1000m));
+        }
+
+        private void OnRoiDrawn(Rectangle r)
+        {
+            if (_h == IntPtr.Zero)
+                return;
+            int slot = -1;
+            for (int i = 0; i < MaxRoi; ++i)
+                if (!_roiUsed[i]) { slot = i; break; }
+            if (slot < 0)
+            {
+                MessageBox.Show(this, "ROI는 최대 " + MaxRoi + "개까지 지정할 수 있습니다. 우클릭으로 삭제하세요.", "ROI",
+                    MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+            _roiUsed[slot] = true;
+            _roiRect[slot] = r;
+            Native.mvp_roi_set(_h, slot, r.Left, r.Top, r.Right, r.Bottom);
+            _pic.Rois.Add(new VideoView.RoiOverlay { R = r, Slot = slot, Color = RoiColors[slot % RoiColors.Length], Label = "R" + (slot + 1) });
+            var item = new RoiItem { Slot = slot, Text = "R" + (slot + 1) + "  --" };
+            int idx = _lstRoi.Items.Add(item);
+            _lstRoi.SelectedIndex = idx;
+            _pic.Invalidate();
+        }
+
+        private void RemoveRoi(int slot)
+        {
+            if (slot < 0 || slot >= MaxRoi || !_roiUsed[slot])
+                return;
+            _roiUsed[slot] = false;
+            if (_h != IntPtr.Zero)
+                Native.mvp_roi_set(_h, slot, 0, 0, 0, 0);
+            _pic.Rois.RemoveAll(o => o.Slot == slot);
+            for (int i = 0; i < _lstRoi.Items.Count; ++i)
+            {
+                if (((RoiItem)_lstRoi.Items[i]).Slot == slot)
+                {
+                    _lstRoi.Items.RemoveAt(i);
+                    break;
+                }
+            }
+            if (_lstRoi.Items.Count > 0 && _lstRoi.SelectedIndex < 0)
+                _lstRoi.SelectedIndex = 0;
+            if (_lstRoi.Items.Count == 0)
+                _spec.Clear();
+            _pic.Invalidate();
+        }
+
+        private void ClearRois()
+        {
+            if (_h != IntPtr.Zero)
+                Native.mvp_roi_clear_all(_h);
+            for (int i = 0; i < MaxRoi; ++i)
+                _roiUsed[i] = false;
+            _pic.Rois.Clear();
+            _lstRoi.Items.Clear();
+            _spec.Clear();
+            _pic.Invalidate();
+        }
+
+        private bool _inUpdate;
+
+        private void UpdateAnalysis(bool force)
+        {
+            if (_inUpdate || _h == IntPtr.Zero || _lstRoi.Items.Count == 0)
+                return;
+            _inUpdate = true;
+            try
+            {
+                UpdateAnalysisCore();
+            }
+            finally
+            {
+                _inUpdate = false;
+            }
+        }
+
+        private void UpdateAnalysisCore()
+        {
+            var hz = new double[4];
+            var st = new double[4];
+            for (int i = 0; i < _lstRoi.Items.Count; ++i)
+            {
+                var it = (RoiItem)_lstRoi.Items[i];
+                double total;
+                int n = Native.mvp_roi_peaks(_h, it.Slot, hz, st, 4, out total);
+                string txt = "R" + (it.Slot + 1) + "  ";
+                if (n > 0)
+                {
+                    var parts = new List<string>();
+                    for (int k = 0; k < Math.Min(n, 3); ++k)
+                        parts.Add(hz[k].ToString("0.0"));
+                    txt += string.Join(" / ", parts.ToArray()) + " Hz";
+                }
+                else
+                {
+                    txt += total > 0 ? "(뚜렷한 진동 없음)" : "--";
+                }
+                if (txt != it.Text)
+                {
+                    it.Text = txt;
+                    _lstRoi.Items[i] = it; // refresh text
+                }
+                foreach (VideoView.RoiOverlay ro in _pic.Rois)
+                    if (ro.Slot == it.Slot)
+                        ro.Label = n > 0 ? "R" + (it.Slot + 1) + " " + hz[0].ToString("0.0") + " Hz" : "R" + (it.Slot + 1);
+            }
+            _pic.Invalidate();
+
+            int sel = _lstRoi.SelectedIndex;
+            if (sel < 0 && _lstRoi.Items.Count > 0)
+                return;
+            var cur = (RoiItem)_lstRoi.Items[sel];
+            var buf = new float[(int)_numMaxHz.Value + 1];
+            int nb = Native.mvp_roi_hist(_h, cur.Slot, buf, buf.Length);
+            if (nb > 0)
+            {
+                double total2;
+                int np = Native.mvp_roi_peaks(_h, cur.Slot, hz, st, 4, out total2);
+                var pk = new double[Math.Max(0, np)];
+                Array.Copy(hz, pk, pk.Length);
+                _spec.SetData(buf, nb, pk, "R" + (cur.Slot + 1) + "  주파수 분포 (표본 " + ((long)total2) + ")",
+                    RoiColors[cur.Slot % RoiColors.Length]);
+            }
+        }
+
 
         private void BuildUi()
         {
@@ -501,10 +954,11 @@ namespace MvRawPlayer
                 ForeColor = Color.DimGray,
                 TextAlign = ContentAlignment.MiddleLeft,
                 Padding = new Padding(10, 0, 0, 0),
-                Text = "마우스 휠: 확대/축소  |  드래그: 이동  |  더블클릭 또는 0: 화면 맞춤  |  Ctrl+휠: 재생 속도  |  Shift+휠: 누적 시간  |  Space: 재생/일시정지  |  ←/→: ±1초",
+                Text = "마우스 휠: 확대/축소  |  드래그: 이동  |  더블클릭 또는 0: 화면 맞춤  |  Shift+드래그: ROI  |  Ctrl+휠: 재생 속도  |  Shift+휠: 누적 시간  |  Space: 재생/일시정지  |  ←/→: ±1초",
             };
 
             Controls.Add(_pic);
+            Controls.Add(BuildAnalysisPanel());
             Controls.Add(top);
             Controls.Add(bottom);
             Controls.Add(hintBar);
@@ -582,6 +1036,8 @@ namespace MvRawPlayer
             _lblPath.Text = path;
             Text = Path.GetFileName(path) + "  (" + w + "x" + h + ")  -  MV RAW Player";
 
+            ClearRois();
+            ApplyAnalysisConfig();
             Native.mvp_set_loop(_h, _chkLoop.Checked ? 1 : 0);
             ApplySpeed();
             ApplyAccumulation();
@@ -591,6 +1047,7 @@ namespace MvRawPlayer
 
         private void CloseFile()
         {
+            ClearRois();
             if (_h != IntPtr.Zero)
             {
                 IntPtr h = _h;
@@ -709,6 +1166,12 @@ namespace MvRawPlayer
                 _bmp.UnlockBits(data);
             }
             _pic.Invalidate();
+
+            if (++_anTick >= 8)
+            {
+                _anTick = 0;
+                UpdateAnalysis(false);
+            }
 
             long pos = Native.mvp_get_position_us(_h);
             if (!_dragging)
